@@ -1,0 +1,38 @@
+# Replace the example intake URL and provision the scoped key through your secret system.
+# This example requires a Vector build with the sinks-tenex_telemetry feature.
+data_dir: ./vector-data
+
+secret:
+  tenex:
+    type: directory
+    path: /etc/vector/secrets
+
+sources:
+  incoming:
+    type: http_server
+    address: 127.0.0.1:8080
+    decoding:
+      codec: json
+
+transforms:
+  delivery_identity:
+    type: remap
+    inputs: [incoming]
+    source: |
+      if !exists(.event_id) {
+        .event_id = uuid_v4()
+      }
+
+sinks:
+  tenex:
+    type: tenex_telemetry
+    inputs: [delivery_identity]
+    endpoint: https://intake.example.com/events
+    api_key: SECRET[tenex.telemetry_api_key]
+    event_id_field: event_id
+    acknowledgements:
+      enabled: true
+    buffer:
+      type: disk
+      max_size: 268435488
+      when_full: block
