@@ -375,6 +375,9 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
         // If the given buffer is too large to be buffered at all, then bypass the internal buffer.
         if buf.len() >= self.buf.capacity() {
             self.inner.write_all(buf).await?;
+            // Async files can accept bytes before the write completes. Publish
+            // progress only after a reader can observe those bytes.
+            self.inner.flush().await?;
 
             let flush_result = flush_result.get_or_insert(FlushResult::default());
             flush_result.events_flushed += event_count as u64;
@@ -408,16 +411,15 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
         let events_flushed = self.unflushed_events as u64;
         let bytes_flushed = self.buf.len() as u64;
 
-        let result = self.inner.write_all(&self.buf[..]).await;
+        self.inner.write_all(&self.buf[..]).await?;
+        self.inner.flush().await?;
         self.unflushed_events = 0;
         self.buf.clear();
 
-        result.map(|()| {
-            Some(FlushResult {
-                events_flushed,
-                bytes_flushed,
-            })
-        })
+        Ok(Some(FlushResult {
+            events_flushed,
+            bytes_flushed,
+        }))
     }
 
     /// Gets a reference to the underlying writer.
@@ -1990,5 +1992,90 @@ where
 {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod flush_visibility_tests {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use tokio::io::AsyncWrite;
+
+    use super::TrackingBufWriter;
+
+    #[derive(Default)]
+    struct DeferredWriter {
+        pending: Vec<u8>,
+        visible: Vec<u8>,
+        refuse_flush: bool,
+    }
+
+    impl AsyncWrite for DeferredWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.pending.extend_from_slice(data);
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.refuse_flush {
+                return Poll::Ready(Err(io::Error::other("fixture flush failure")));
+            }
+            let pending = std::mem::take(&mut self.pending);
+            self.visible.extend_from_slice(&pending);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_progress_requires_visible_bytes() {
+        let mut writer = TrackingBufWriter::with_capacity(16, DeferredWriter::default());
+        assert!(writer.write(1, b"record").await.unwrap().is_none());
+        let progress = writer.flush().await.unwrap().unwrap();
+        assert_eq!(progress.events_flushed, 1);
+        assert_eq!(writer.get_ref().visible, b"record");
+    }
+
+    #[tokio::test]
+    async fn direct_progress_requires_visible_bytes() {
+        let mut writer = TrackingBufWriter::with_capacity(4, DeferredWriter::default());
+        let progress = writer.write(1, b"record").await.unwrap().unwrap();
+        assert_eq!(progress.events_flushed, 1);
+        assert_eq!(writer.get_ref().visible, b"record");
+    }
+
+    #[tokio::test]
+    async fn failed_flush_publishes_no_progress() {
+        let inner = DeferredWriter {
+            refuse_flush: true,
+            ..DeferredWriter::default()
+        };
+        let mut writer = TrackingBufWriter::with_capacity(16, inner);
+        assert!(writer.write(1, b"record").await.unwrap().is_none());
+        assert!(writer.flush().await.is_err());
+        assert!(writer.get_ref().visible.is_empty());
+        assert_eq!(writer.unflushed_events, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_direct_flush_publishes_no_progress() {
+        let inner = DeferredWriter {
+            refuse_flush: true,
+            ..DeferredWriter::default()
+        };
+        let mut writer = TrackingBufWriter::with_capacity(4, inner);
+        assert!(writer.write(1, b"record").await.is_err());
+        assert!(writer.get_ref().visible.is_empty());
     }
 }
